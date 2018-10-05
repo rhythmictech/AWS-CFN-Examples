@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description:
+  This CloudFormation stack sets an IAM Password Policy and creates two initial
+  security groups in the region in which the stack is created, one for default 
+  admin access and one to restrict outbound access by default. These are useful
+  first steps before beginning to build other resources in any new region. Note
+  that the IAM password policy is global, and you may wish to modify this if
+  you operate out of multiple regions.
+Parameters:
+  VPCStack:
+    Type: 'String'
+    Description: 'Name of the VPC stack'
+    Default: 'main-vpc'
+  MaxPasswordAge:
+    Type: 'Number'
+    Description: 'Maximum age for passwords'
+    Default: 180
+    ConstraintDescription: '(90-365 days)'
+    MinValue: 90
+    MaxValue: 365
+  MinPasswordLength:
+    Type: 'Number'
+    Description: 'Minimum password length'
+    Default: 10
+    ConstraintDescription: '(8-128 characters)'
+    MinValue: 8
+    MaxValue: 128
+  PasswordHistory:
+    Type: 'Number'
+    Description: 'Number of previous passwords to remember'
+    Default: 3
+    ConstraintDescription: '(1-24 passwords)'
+    MinValue: 1
+    MaxValue: 24
+  RequireLowercaseChars:
+    Type: 'String'
+    Description: 'Require at least one lowercase character'
+    Default: 'True'
+    AllowedValues:
+    - 'True'
+    - 'False'
+  RequireNumbers:
+    Type: 'String'
+    Description: 'Require at least one number'
+    Default: 'True'
+    AllowedValues:
+    - 'True'
+    - 'False'
+  RequireSymbols:
+    Type: 'String'
+    Description: 'Require at least one symbol'
+    Default: 'True'
+    AllowedValues:
+    - 'True'
+    - 'False'
+  RequireUppercaseChars:
+    Type: 'String'
+    Description: 'Require at least one uppercase character'
+    Default: 'True'
+    AllowedValues:
+    - 'True'
+    - 'False'
+Resources:
+  AdminAccessSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'USE1-AdminAccess'
+      VpcId:
+        Fn::ImportValue: !Sub '${VPCStack}-VPCID'
+  RestrictOutboundSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'USE1-RestrictOutbound'
+      VpcId:
+        Fn::ImportValue: !Sub '${VPCStack}-VPCID'
+      SecurityGroupEgress:
+      - IpProtocol: 'tcp'
+        FromPort: 1
+        ToPort: 1
+        CidrIp: 0.0.0.0/32
+
+  IAMPasswordPolicy:
+    Type: 'Custom::IAMPolicyResource'
+    Properties:
+      ServiceToken: !GetAtt IAMPasswordPolicyResource.Arn
+      Region: !Ref "AWS::Region"
+
+  IAMPasswordPolicyResource:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Runtime: python2.7
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt IAMPasswordPolicyResourceExecutionRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          from botocore.exceptions import ClientError
+          import json
+          import cfnresponse
+
+          iam = boto3.client("iam")
+
+          # Lambda entry point
+          def lambda_handler(event, context):
+
+            if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+              res, reason = update_policy()
+            elif event['RequestType'] == 'Delete':
+              res, reason = delete_policy()
+            else:
+              res = False
+              reason = "Unknown operation: " + event['RequestType']
+            responseData = {}
+            responseData['Reason'] = reason
+            if res:
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            else:
+              cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+
+          def update_policy():
+            try:
+
+              response = iam.update_account_password_policy(
+                  AllowUsersToChangePassword=True,
+                  HardExpiry=False,
+                  MaxPasswordAge=${MaxPasswordAge},
+                  MinimumPasswordLength=${MinPasswordLength},
+                  RequireLowercaseCharacters=${RequireLowercaseChars},
+                  RequireNumbers=${RequireNumbers},
+                  RequireSymbols=${RequireSymbols},
+                  RequireUppercaseCharacters=${RequireUppercaseChars},
+                  PasswordReusePrevention=${PasswordHistory})
+
+              return(True, response)
+            except Exception as e:
+              return (False, "Cannot update policy: " + str(e))
+
+          def delete_policy():
+            try:
+
+              policy = iam.get_account_password_policy()
+              response = iam.delete_account_password_policy()
+              return (True, response)
+            except Exception as e:
+              return (False, "Cannot delete policy: " + str(e))
+
+  IAMPasswordPolicyResourceExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: IAMPasswordCreatorPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          # lambdas like to log stuff..
+          - Effect: 'Allow'
+            Action:
+            - 'logs:CreateLogGroup'
+            - 'logs:CreateLogStream'
+            - 'logs:PutLogEvents'
+            Resource: '*'
+          # core permissions for this function
+          - Effect: Allow
+            Action:
+              - iam:GetAccountPasswordPolicy
+              - iam:UpdateAccountPasswordPolicy
+              - iam:DeleteAccountPasswordPolicy
+            Resource: "*"
+
+Outputs:
+  AdminAccessSecurityGroup:
+    Description: 'Admin access security group'
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminAccessSG'
+    Value: !Ref AdminAccessSecurityGroup
+  RestrictOutboundSecurityGroup:
+    Description: 'No outbound access security group'
+    Export:
+      Name: !Sub '${AWS::StackName}-RestrictOutboundSG'
+    Value: !Ref RestrictOutboundSecurityGroup
