@@ -1,0 +1,485 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 
+  Create a WordPress-ready instance, standing behind CloudFront and an ELB and with a shared EFS.
+  This is suitable for highly available WordPress sites. 
+Parameters:
+  # General / networking parameters
+  VPCStack:
+    Type: 'String'
+    Description: 'Name of the VPC stack'
+    Default: 'main-vpc'
+  CertificateArn:
+    Description: 'CertificateArn'
+    Type: 'String'
+
+  SiteURL:
+    Description: 'Site URL'
+    Type: 'String'
+
+  # Instance / ASG parameters
+  InstanceType:
+    Description: 'EC2 instance type'
+    Type: 'String'
+    Default: 't2.small'
+    AllowedValues: [t2.micro, t2.small, t2.medium,
+      t2.large, m5.large, m5.xlarge, m5.2xlarge,
+      c5.large, c5.xlarge ]
+  InstanceImage:
+    Description: 'Image ID'
+    Type: 'String'
+    # amzn-linux-2 us-east-1
+    Default: 'ami-04681a1dbd79675a5'
+  Keypair:
+    Description: 'Keypair Name'
+    Type: 'String'
+  WPASGMax:
+    Description: 'Max ASG members'
+    Type: 'Number'
+    Default: 1
+  WPASGMin:
+    Description: 'Minimum ASG members'
+    Type: 'Number'
+    Default: 1
+
+
+  # MySQL RDS Parameters
+  DBName:
+    Description: 'DB Name'
+    Type: 'String'
+    Default: wpdefault
+    MinLength: 6
+    MaxLength: 32
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: must begin with a letter and contain only alphanumeric
+      characters.
+  DBUser:
+    Description: 'DB Admin user'
+    Type: 'String'
+    Default: 'wpuser'
+    MinLength: 6
+    MaxLength: 16
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: 'must begin with a letter and contain only alphanumeric characters.'
+  DBPassword:
+    NoEcho: 'true'
+    Description: 'DB Admin password'
+    Type: 'String'
+    MinLength: 8
+    MaxLength: 40
+    AllowedPattern: '[a-zA-Z0-9]+'
+    ConstraintDescription: 'must contain only alphanumeric characters.'
+  DBAllocatedStorage:
+    Description: The size of the database (Gb)
+    Type: Number
+    Default: 5
+    MinValue: 5
+    MaxValue: 1024
+    ConstraintDescription: 'must be between 5 and 1024Gb.'
+  DBInstanceType:
+    Description: The database instance type
+    Type: String
+    Default: db.t2.medium
+    AllowedValues: [db.t2.micro, db.t2.small, db.t2.medium,
+      db.t2.large, db.m5.large, db.m5.xlarge, db.m5.2xlarge,
+      db.c5.large, db.c5.xlarge ]
+    ConstraintDescription: must select a valid database instance type.
+  DBMultiAZ:
+    Description: Multi-AZ master database
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    ConstraintDescription: must be true or false.
+
+
+Resources:
+
+  # Shared EFS file system
+  WPEFS:
+    Type: 'AWS::EFS::FileSystem'
+    Properties:
+      Encrypted: true
+      FileSystemTags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-ELB-SG'
+  WPEFSTarget1:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref WPEFS
+      SecurityGroups:
+      - !Ref WPEFSSecurityGroup
+      SubnetId:
+        Fn::ImportValue: !Sub '${VPCStack}-PublicSubnet1'
+  WPEFSTarget2:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref WPEFS
+      SecurityGroups:
+      - !Ref WPEFSSecurityGroup
+      SubnetId:
+        Fn::ImportValue: !Sub '${VPCStack}-PublicSubnet2'
+  WPEFSTarget3:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref WPEFS
+      SecurityGroups:
+      - !Ref WPEFSSecurityGroup
+      SubnetId:
+        Fn::ImportValue: !Sub '${VPCStack}-PublicSubnet3'
+
+  WPEFSSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: !Sub '${AWS::StackName}-EFS-SecurityGroup'
+      VpcId:
+        Fn::ImportValue: !Sub '${VPCStack}-VPCID'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref WPSecurityGroup
+
+  # WordPress ELB
+  WPELBSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: !Sub '${AWS::StackName}-ELB-SG'
+      VpcId:
+        Fn::ImportValue: !Sub '${VPCStack}-VPCID'
+      SecurityGroupIngress:
+      - FromPort: 443
+        ToPort: 443
+        IpProtocol: tcp
+        CidrIp: '0.0.0.0/0'
+
+  WPELB:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      Name: !Sub '${AWS::StackName}-ELB'
+      Subnets:
+        - Fn::ImportValue: !Sub '${VPCStack}-PublicSubnet1'
+        - Fn::ImportValue: !Sub '${VPCStack}-PublicSubnet2'
+        - Fn::ImportValue: !Sub '${VPCStack}-PublicSubnet3'
+      SecurityGroups:
+      - !Ref WPELBSecurityGroup
+
+  WPELBListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      Certificates:
+      - CertificateArn: !Ref CertificateArn
+
+      DefaultActions:
+        - Type: 'forward'
+          TargetGroupArn: !Ref WPELBTargetGroup
+      LoadBalancerArn: !Ref WPELB
+      Port: 443
+      Protocol: 'HTTPS'
+
+  WPELBTargetGroup:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Properties:
+      Name: !Sub '${AWS::StackName}-TargetGroup'
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: 'HTTP'
+      UnhealthyThresholdCount: 5
+      VpcId:
+        Fn::ImportValue: !Sub '${VPCStack}-VPCID'
+
+  # WordPress AutoScale Group / Instance Definition
+  WPASG:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      Cooldown: 60
+      HealthCheckGracePeriod: 120
+      HealthCheckType: ELB
+      LaunchConfigurationName: !Ref WPASGLC
+      MaxSize: !Ref WPASGMax
+      MinSize: !Ref WPASGMin
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ASG'
+          PropagateAtLaunch: true
+      TargetGroupARNs:
+        - !Ref WPELBTargetGroup
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub '${VPCStack}-PublicSubnet1'
+        - Fn::ImportValue: !Sub '${VPCStack}-PublicSubnet2'
+        - Fn::ImportValue: !Sub '${VPCStack}-PublicSubnet3'
+    # CreationPolicy:
+    #   ResourceSignal:
+    #     Count: 1
+    #     Timeout: PT5M
+
+  WPASGLC:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+            - install_packages
+            - config_services
+        install_packages:
+          packages:
+            yum:
+              awslogs: []
+              httpd: []
+              # unfortunately you cant run a lot of wp-cli commands without the
+              # mysql client
+              mariadb: []
+              mod_php72u: []
+              php72u-cli: []
+              php72u-common: []
+              php72u-fpm: []
+              php72u-gd: []
+              php72u-json: []
+              php72u-mysqlnd: []
+
+        config_services:
+          files:
+            /etc/php.d/99-wordpress.conf:
+              content: |
+                display_errors = Off
+                error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
+                max_input_time = 60
+                max_execution_time = 30
+                memory_limit = 128M
+                post_max_size = 64M
+                upload_max_filesize = 64M
+                variables_order = "GPCS"
+            /etc/httpd/conf.d/wordpress.conf:
+              content: !Sub |
+                <VirtualHost _default_:80>
+                    ServerName ${SiteURL}
+
+                    CustomLog /opt/www/logs/access_log combined
+                    ErrorLog /opt/www/logs/error_log
+
+                    DocumentRoot /opt/www/html
+
+                    <Directory /opt/www/html>
+                        AllowOverride all
+                        Require all granted
+                    </Directory>
+                  </VirtualHost>
+          commands:
+            0_install_wpcli:
+              command: |
+                curl -o /usr/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+                chmod 755 /usr/bin/wp
+
+          services:
+            sysvinit:
+              httpd:
+                enabled: true
+                ensureRunning: true
+    Properties:
+      ImageId: !Ref InstanceImage
+      InstanceType: !Ref InstanceType
+      SecurityGroups:
+      - !Ref WPSecurityGroup
+      KeyName: !Ref Keypair
+      InstanceMonitoring: 'true'
+      IamInstanceProfile: !Ref WPInstanceProfile
+
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash -xe
+            amazon-linux-extras install epel
+            rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-7
+            rpm -Uvh https://centos7.iuscommunity.org/ius-release.rpm
+
+            mkdir -p /opt/www/{html,logs}
+            mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 ${WPEFS}.efs.${AWS::Region}.amazonaws.com:/ /opt/www/html
+            /opt/aws/bin/cfn-init --verbose --stack ${AWS::StackName} --resource WPASGLC --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal --exit-code $? --stack ${AWS::StackName} --resource WPASG --region ${AWS::Region}
+
+
+  WPSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: !Sub '${AWS::StackName}-ASG-SG'
+      VpcId:
+        Fn::ImportValue: !Sub '${VPCStack}-VPCID'
+      SecurityGroupIngress:
+      - IpProtocol: 'tcp'
+        FromPort: 80
+        ToPort: 80
+        SourceSecurityGroupId: !Ref WPELBSecurityGroup
+
+  WPInstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          Effect: 'Allow'
+          Principal:
+            Service: 'ec2.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+      - PolicyName: logs
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            - logs:DescribeLogStreams
+            Resource:
+            - arn:aws:logs:*:*:*
+  WPInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: '/'
+      Roles:
+      - !Ref WPInstanceRole
+
+# DatabaseName
+  WPDBSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'WP DB SG'
+      VpcId:
+        Fn::ImportValue: !Sub '${VPCStack}-VPCID'
+      SecurityGroupIngress:
+      - FromPort: 3306
+        ToPort: 3306
+        IpProtocol: tcp
+        SourceSecurityGroupId: !Ref WPSecurityGroup
+
+  WPDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: !Ref 'DBAllocatedStorage'
+      AllowMajorVersionUpgrade: false
+      AutoMinorVersionUpgrade: true
+      BackupRetentionPeriod: 7
+      DBName: !Ref 'DBName'
+      DBInstanceClass: !Ref 'DBInstanceType'
+      DBSubnetGroupName:
+        Fn::ImportValue: !Sub '${VPCStack}-DBSubnetGroup'
+      Engine: MySQL
+      EngineVersion: '5.6.40'
+      MasterUsername: !Ref DBUser
+      MasterUserPassword: !Ref DBPassword
+      MultiAZ: !Ref DBMultiAZ
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-RDS'
+      VPCSecurityGroups:
+        - !Ref WPDBSecurityGroup
+    DeletionPolicy: Snapshot
+
+  # CloudFront stuff
+  WPCFDistribution:
+    Type: 'AWS::CloudFront::Distribution'
+    Properties:
+      DistributionConfig:
+        Aliases:
+        - !Ref SiteURL
+        CacheBehaviors:
+        - PathPattern: wp-includes/*
+          AllowedMethods:
+          - DELETE
+          - GET
+          - HEAD
+          - OPTIONS
+          - PATCH
+          - POST
+          - PUT
+          DefaultTTL: 900
+          MaxTTL: 900
+          MinTTL: 900
+          ForwardedValues:
+            QueryString: true
+            Headers:
+            - Host
+          TargetOriginId: elb
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+        - PathPattern: wp-content/*
+          AllowedMethods:
+          - DELETE
+          - GET
+          - HEAD
+          - OPTIONS
+          - PATCH
+          - POST
+          - PUT
+          DefaultTTL: 900
+          MaxTTL: 900
+          MinTTL: 900
+          ForwardedValues:
+            QueryString: true
+            Headers:
+            - Host
+          TargetOriginId: elb
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+        Comment: !Sub '${AWS::StackName}-Dist'
+        DefaultCacheBehavior:
+          AllowedMethods:
+          - DELETE
+          - GET
+          - HEAD
+          - OPTIONS
+          - PATCH
+          - POST
+          - PUT
+          DefaultTTL: 0
+          MaxTTL: 0
+          MinTTL: 0
+          ForwardedValues:
+            QueryString: true
+            Headers:
+            - '*'
+            Cookies:
+              Forward: all
+          TargetOriginId: elb
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+        Enabled: true
+        Origins:
+        - DomainName: !GetAtt WPELB.DNSName
+          Id: elb
+          CustomOriginConfig:
+            OriginProtocolPolicy: https-only
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.1_2016
+
+Outputs:
+  # EFS Outputs
+  WPEFS:
+    Description: WordPress EFS
+    Value: !Ref WPEFS
+  WPEFSTarget:
+    Description: WordPress EFS Mountpoint
+    Value: !Sub '${WPEFS}.efs.${AWS::Region}.amazonaws.com'
+  WPELBDNSName:
+    Description: 'ELB DNS name for WordPress'
+    Value: !GetAtt WPELB.DNSName
+  WPELBSG:
+    Description: 'ELB Security Group'
+    Value: !Ref WPELBSecurityGroup
+  WPInstanceSG:
+    Description: 'ELB Instance Security Group'
+    Value: !Ref WPSecurityGroup
+  WPJDBUrl:
+    Description: DB URL
+    Value: !Sub '${WPDB.Endpoint.Address}:${WPDB.Endpoint.Port}'
+  WPJDBName:
+    Description: DB Name
+    Value: !Sub '${DBName}'
+  WPCFDNSName:
+    Description: 'CloudFront DNS name for WordPress (use this)'
+    Value: !GetAtt WPCFDistribution.DomainName
