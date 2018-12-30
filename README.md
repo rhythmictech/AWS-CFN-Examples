@@ -9,7 +9,7 @@ rather than in a stack. The templates are easily modified to fit whatever your s
 
 # Security
 * iam-password-policy
-   Uses a custom resource to create an IAM Password Policy via CloudFormation. 
+   Uses a custom resource to create an IAM Password Policy via CloudFormation.
 
 # Network
 * main-vpc
@@ -18,8 +18,12 @@ rather than in a stack. The templates are easily modified to fit whatever your s
    and DB subnets each share one route table per AZ, routing traffic out the respective NAT gateways. This
    design yields a simple 3 AZ setup ready for use in most scenarios, with properly configured networking.
 
+# Packer
+* packer
+  Creates an instance that can build AMIs using Hashicorp Packer, with the correct
+  IAM role.
+
 # WordPress
 * wordpress-with-efs-and-cloudfront
    Creates the foundation for a WordPress site sitting behind CloudFront, an ELB and an ASG. This is suitable
-   for high availability, using EFS to share files across multiple instances within the ASG. 
-
+   for high availability, using EFS to share files across multiple instances within the ASG.
